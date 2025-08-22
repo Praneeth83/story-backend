@@ -1,9 +1,9 @@
 package models
 
-type Follow struct {
+type FollowRequest struct {
 	ID         uint `gorm:"primaryKey" json:"id"`
-	FollowerID uint `gorm:"not null;uniqueIndex:idx_follower_followee" json:"follower_id"` // who follows
-	FolloweeID uint `gorm:"not null;uniqueIndex:idx_follower_followee" json:"followee_id"` // who is being followed
+	FollowerID uint `gorm:"not null;uniqueIndex:idx_follow_requests_unique" json:"follower_id"` // who follows
+	FolloweeID uint `gorm:"not null;uniqueIndex:idx_follow_requests_unique" json:"followee_id"` // who is being followed
 
 	// -------- Relations --------
 	Follower User `gorm:"foreignKey:FollowerID" json:"follower"` // the follower user

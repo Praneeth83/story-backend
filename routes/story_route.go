@@ -13,4 +13,7 @@ func StoryRoutes(e *echo.Echo) {
 	stories.GET("/feed", controllers.GetStoriesFeed)
 	stories.GET("/user/:id", controllers.GetUserStories)
 	stories.DELETE("/:id", controllers.DeleteStory)
+	stories.POST("/:id/view", controllers.ViewStory)
+	stories.GET("/:id/views", controllers.GetStoryViews)
+
 }

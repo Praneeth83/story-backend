@@ -1,9 +1,9 @@
 package controllers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"story-backend/config"
@@ -11,18 +11,18 @@ import (
 	"story-backend/utils"
 
 	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
 )
 
 // ---------- Feed: GET /stories/feed ----------
-// Returns stories for the logged-in user
-// ---------- Feed: GET /stories/feed ----------
 // Returns stories from users the logged-in user follows
 func GetStoriesFeed(c echo.Context) error {
-	userID, err := getUserIDFromToken(c)
+	userID, err := utils.GetUserID(c)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
 	}
 
+	// Struct for scanning raw query results
 	type row struct {
 		UserID     uint
 		Username   string
@@ -30,6 +30,7 @@ func GetStoriesFeed(c echo.Context) error {
 		StoryID    uint
 		MediaURL   string
 		MediaType  string
+		CreatedAt  time.Time
 		ViewedID   *uint
 	}
 
@@ -43,6 +44,7 @@ func GetStoriesFeed(c echo.Context) error {
 			s.id AS story_id,
 			s.media_url,
 			s.media_type,
+			s.created_at,
 			sv.id AS viewed_id`).
 		// Join users table
 		Joins("JOIN users AS u ON u.id = s.user_id").
@@ -51,6 +53,7 @@ func GetStoriesFeed(c echo.Context) error {
 		// Keep only stories that belong to someone I follow OR myself
 		Where("(f.follower_id IS NOT NULL OR s.user_id = ?)", userID).
 		Where("s.expires_at > ?", time.Now()).
+		// Check if current user has viewed story
 		Joins("LEFT JOIN story_views AS sv ON sv.story_id = s.id AND sv.viewer_id = ?", userID).
 		Order("u.id ASC, s.created_at ASC").
 		Scan(&rows).Error
@@ -58,11 +61,13 @@ func GetStoriesFeed(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to build feed"})
 	}
 
+	// Response structs
 	type storyItem struct {
-		ID        uint   `json:"id"`
-		MediaURL  string `json:"media_url"`
-		MediaType string `json:"media_type"`
-		Seen      bool   `json:"seen"`
+		ID        uint      `json:"id"`
+		MediaURL  string    `json:"media_url"`
+		MediaType string    `json:"media_type"`
+		CreatedAt time.Time `json:"created_at"`
+		Seen      bool      `json:"seen"`
 	}
 	type userBlock struct {
 		UserID     uint        `json:"user_id"`
@@ -93,10 +98,12 @@ func GetStoriesFeed(c echo.Context) error {
 			ID:        r.StoryID,
 			MediaURL:  r.MediaURL,
 			MediaType: r.MediaType,
+			CreatedAt: r.CreatedAt,
 			Seen:      seen,
 		})
 	}
 
+	// Preserve ordering by iterating through rows
 	out := make([]userBlock, 0, len(feedMap))
 	var lastUserID uint
 	for _, r := range rows {
@@ -105,108 +112,50 @@ func GetStoriesFeed(c echo.Context) error {
 			lastUserID = r.UserID
 		}
 	}
+
 	return c.JSON(http.StatusOK, out)
 }
 
-// GET /stories/user/:id
+// ---------- Get user stories: GET /stories/user/:id ----------
 func GetUserStories(c echo.Context) error {
-	currentUserID, err := getUserIDFromToken(c)
+	uidStr := c.Param("id")
+	targetID, err := strconv.Atoi(uidStr)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
-	}
-
-	targetIDParam := c.Param("id")
-	targetID, err := strconv.Atoi(targetIDParam)
-	if err != nil || targetID <= 0 {
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid user id"})
 	}
 
-	// ✅ Check if the user exists
-	var exists bool
+	// Check user exists
+	var count int64
 	if err := config.DB.Model(&models.User{}).
-		Select("count(*) > 0").
 		Where("id = ?", targetID).
-		Find(&exists).Error; err != nil {
+		Count(&count).Error; err != nil {
 		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
 	}
-	if !exists {
+	if count == 0 {
 		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
 	}
 
-	type row struct {
-		StoryID    uint
-		MediaURL   string
-		MediaType  string
-		ViewedID   *uint
-		UserID     uint
-		Username   string
-		ProfilePic string
+	var stories []models.Story
+	if err := config.DB.Where("user_id = ? AND expires_at > ?", targetID, time.Now()).
+		Order("created_at desc").
+		Find(&stories).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
 	}
 
-	var rows []row
-	err = config.DB.
-		Table("stories AS s").
-		Select(`
-			s.id AS story_id,
-			s.media_url,
-			s.media_type,
-			sv.id AS viewed_id,
-			u.id AS user_id,
-			u.username,
-			u.profile_pic`).
-		Joins("JOIN users AS u ON u.id = s.user_id").
-		Joins("LEFT JOIN story_views AS sv ON sv.story_id = s.id AND sv.viewer_id = ?", currentUserID).
-		Where("s.user_id = ?", targetID).
-		Where("s.expires_at > ?", time.Now()).
-		Order("s.created_at ASC").
-		Scan(&rows).Error
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to fetch stories"})
-	}
-
-	type storyItem struct {
-		ID        uint   `json:"id"`
-		MediaURL  string `json:"media_url"`
-		MediaType string `json:"media_type"`
-		Seen      bool   `json:"seen"`
-	}
-
-	out := struct {
-		UserID     uint        `json:"user_id"`
-		Username   string      `json:"username"`
-		ProfilePic string      `json:"profile_pic"`
-		Stories    []storyItem `json:"stories"`
-	}{}
-
-	if len(rows) > 0 {
-		out.UserID = rows[0].UserID
-		out.Username = rows[0].Username
-		out.ProfilePic = rows[0].ProfilePic
-	}
-
-	for _, r := range rows {
-		out.Stories = append(out.Stories, storyItem{
-			ID:        r.StoryID,
-			MediaURL:  r.MediaURL,
-			MediaType: r.MediaType,
-			Seen:      r.ViewedID != nil,
-		})
-	}
-
-	return c.JSON(http.StatusOK, out)
+	return c.JSON(http.StatusOK, stories)
 }
 
-// ---------- Add Story: POST /stories/add ----------
+// ---------- Add story: POST /stories ----------
 type addStoryReq struct {
 	MediaURL   string `json:"media_url"`
 	MediaType  string `json:"media_type"`
-	TTLMinutes int    `json:"ttl_minutes,omitempty"`
+	TTLMinutes int    `json:"ttl_minutes"`
 }
 
 func AddStory(c echo.Context) error {
-	userID, err := getUserIDFromToken(c)
+	userID, err := utils.GetUserID(c)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
 	}
 
 	var req addStoryReq
@@ -214,75 +163,137 @@ func AddStory(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid input"})
 	}
 
-	ttl := 24 * time.Hour
-	if req.TTLMinutes > 0 {
-		ttl = time.Duration(req.TTLMinutes) * time.Minute
+	// TTL (default 24h, max 24h)
+	if req.TTLMinutes <= 0 || req.TTLMinutes > 1440 {
+		req.TTLMinutes = 1440
 	}
+	ttl := time.Duration(req.TTLMinutes) * time.Minute
 
-	st := models.Story{
+	story := models.Story{
 		UserID:    userID,
 		MediaURL:  req.MediaURL,
 		MediaType: req.MediaType,
 		CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(ttl),
 	}
-	if err := config.DB.Create(&st).Error; err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to create story"})
-	}
 
-	return c.JSON(http.StatusCreated, st)
+	if err := config.DB.Create(&story).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "database error"})
+	}
+	return c.JSON(http.StatusCreated, story)
 }
 
-// ---------- Delete Story: DELETE /stories/:id ----------
+// ---------- Delete story: DELETE /stories/:id ----------
 func DeleteStory(c echo.Context) error {
-	userID, err := getUserIDFromToken(c)
+	userID, err := utils.GetUserID(c)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
 	}
 
-	id := c.Param("id")
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid story id"})
+	}
+
 	var story models.Story
 	if err := config.DB.First(&story, "id = ? AND user_id = ?", id, userID).Error; err != nil {
-		return c.JSON(http.StatusForbidden, echo.Map{"error": "story not found or not yours"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "story not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "db error"})
 	}
 
 	if err := config.DB.Delete(&story).Error; err != nil {
-		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "failed to delete story"})
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "delete failed"})
 	}
 
-	return c.JSON(http.StatusOK, echo.Map{"message": "deleted"})
+	return c.NoContent(http.StatusNoContent)
 }
 
-// ---------- Helper: get user_id from JWT ----------
-func getUserIDFromToken(c echo.Context) (uint, error) {
-	authHeader := c.Request().Header.Get("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		return 0, echo.ErrUnauthorized
-	}
-
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	claims, err := utils.ParseToken(tokenStr)
+// ---------- Mark story as viewed: POST /stories/:id/view ----------
+func ViewStory(c echo.Context) error {
+	userID, err := utils.GetUserID(c)
 	if err != nil {
-		return 0, echo.ErrUnauthorized
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
 	}
 
-	uidVal, ok := claims["user_id"]
-	if !ok {
-		return 0, echo.ErrUnauthorized
+	idStr := c.Param("id")
+	storyID, err := strconv.Atoi(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid story id"})
 	}
 
-	switch v := uidVal.(type) {
-	case float64:
-		return uint(v), nil
-	case int:
-		return uint(v), nil
-	case string:
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return 0, echo.ErrUnauthorized
+	// Ensure story exists and is active
+	var story models.Story
+	if err := config.DB.First(&story, "id = ? AND expires_at > ?", storyID, time.Now()).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "story not found or expired"})
 		}
-		return uint(n), nil
-	default:
-		return 0, echo.ErrUnauthorized
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "db error"})
 	}
+
+	// Insert into story_views (ignore duplicate views)
+	view := models.StoryView{
+		StoryID:  uint(storyID),
+		ViewerID: userID,
+		ViewedAt: time.Now(),
+	}
+	if err := config.DB.Create(&view).Error; err != nil {
+		return c.JSON(http.StatusOK, echo.Map{"message": "already viewed"})
+	}
+
+	return c.JSON(http.StatusCreated, echo.Map{"message": "view recorded"})
+}
+
+// ---------- Get views of a story: GET /stories/:id/views ----------
+func GetStoryViews(c echo.Context) error {
+	userID, err := utils.GetUserID(c)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
+	}
+
+	idStr := c.Param("id")
+	storyID, err := strconv.Atoi(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, echo.Map{"error": "invalid story id"})
+	}
+
+	// Ensure story exists and belongs to logged-in user (privacy check)
+	var story models.Story
+	if err := config.DB.First(&story, "id = ?", storyID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.JSON(http.StatusNotFound, echo.Map{"error": "story not found"})
+		}
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "db error"})
+	}
+	if story.UserID != userID {
+		return c.JSON(http.StatusForbidden, echo.Map{"error": "not your story"})
+	}
+
+	// Fetch views with viewer info
+	var views []struct {
+		ID         uint      `json:"id"`
+		ViewerID   uint      `json:"viewer_id"`
+		Username   string    `json:"username"`
+		ProfilePic *string   `json:"profile_pic"`
+		ViewedAt   time.Time `json:"viewed_at"`
+	}
+	if err := config.DB.Table("story_views").
+		Select("story_views.id, story_views.viewer_id, users.username, users.profile_pic, story_views.viewed_at").
+		Joins("JOIN users ON users.id = story_views.viewer_id").
+		Where("story_views.story_id = ?", storyID).
+		Order("story_views.viewed_at desc").
+		Find(&views).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, echo.Map{"error": "db error"})
+	}
+
+	// Count total views
+	totalViews := len(views)
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"story_id":    storyID,
+		"total_views": totalViews,
+		"views":       views,
+	})
 }

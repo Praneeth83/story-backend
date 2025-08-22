@@ -16,6 +16,6 @@ func AuthRoutes(e *echo.Echo) {
 
 	// Protected route to get current logged-in user
 	auth.GET("/me", controllers.Me, middleware.JWTAuth())
-	auth.PATCH("/toggle-type", controllers.ToggleAccountType, middleware.JWTAuth())
+	auth.PATCH("/toggle", controllers.ToggleAccountType, middleware.JWTAuth())
 
 }

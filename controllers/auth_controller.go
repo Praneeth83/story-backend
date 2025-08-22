@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 
 	"story-backend/config"
@@ -68,19 +67,21 @@ func Signup(c echo.Context) error {
 
 // Login authenticates user with token-first logic
 func Login(c echo.Context) error {
-	// 1. Check Authorization header first
+	// 1. Try auto-login with token
 	authHeader := c.Request().Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-		userID, err := extractUserIDFromToken(tokenStr)
+		claims, err := utils.ParseToken(tokenStr)
 		if err == nil {
-			var user models.User
-			if err := config.DB.First(&user, userID).Error; err == nil {
-				return c.JSON(http.StatusOK, echo.Map{
-					"user":  userResponse(user),
-					"token": tokenStr,
-					"auto":  true, // auto-login
-				})
+			if userID, err := utils.ExtractUserID(claims); err == nil {
+				var user models.User
+				if err := config.DB.First(&user, userID).Error; err == nil {
+					return c.JSON(http.StatusOK, echo.Map{
+						"user":  userResponse(user),
+						"token": tokenStr,
+						"auto":  true,
+					})
+				}
 			}
 		}
 	}
@@ -115,17 +116,11 @@ func Login(c echo.Context) error {
 	})
 }
 
-// Me returns the logged-in user's info from token
+// Me returns the logged-in user's info (middleware provides user_id)
 func Me(c echo.Context) error {
-	authHeader := c.Request().Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "no token"})
-	}
-
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	userID, err := extractUserIDFromToken(tokenStr)
+	userID, err := utils.GetUserID(c)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
 	}
 
 	var user models.User
@@ -136,56 +131,12 @@ func Me(c echo.Context) error {
 	return c.JSON(http.StatusOK, echo.Map{"user": userResponse(user)})
 }
 
-// -------------------- Helpers --------------------
-
-func userResponse(user models.User) echo.Map {
-	return echo.Map{
-		"id":          user.ID,
-		"username":    user.Username,
-		"email":       user.Email,
-		"profile_pic": user.ProfilePic,
-	}
-}
-
-// Extract user_id safely from JWT token
-func extractUserIDFromToken(tokenStr string) (uint, error) {
-	claims, err := utils.ParseToken(tokenStr)
-	if err != nil {
-		return 0, err
-	}
-
-	uidVal, ok := claims["user_id"]
-	if !ok {
-		return 0, echo.ErrUnauthorized
-	}
-
-	switch v := uidVal.(type) {
-	case float64:
-		return uint(v), nil
-	case int:
-		return uint(v), nil
-	case string:
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return 0, echo.ErrUnauthorized
-		}
-		return uint(n), nil
-	default:
-		return 0, echo.ErrUnauthorized
-	}
-}
-
 // ToggleAccountType flips between public and private
-func ToggleAccountType(c echo.Context) error {
-	authHeader := c.Request().Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "no token"})
-	}
 
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	userID, err := extractUserIDFromToken(tokenStr)
+func ToggleAccountType(c echo.Context) error {
+	userID, err := utils.GetUserID(c)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "invalid token"})
+		return c.JSON(http.StatusUnauthorized, echo.Map{"error": "unauthorized"})
 	}
 
 	var user models.User
@@ -193,10 +144,25 @@ func ToggleAccountType(c echo.Context) error {
 		return c.JSON(http.StatusNotFound, echo.Map{"error": "user not found"})
 	}
 
-	// Toggle type
 	if user.Type == "private" {
+		// Switch to public
 		user.Type = "public"
+
+		// Auto-accept all follow requests
+		var requests []models.FollowRequest
+		if err := config.DB.Where("followee_id = ?", user.ID).Find(&requests).Error; err == nil {
+			for _, req := range requests {
+				follow := models.Follow{
+					FollowerID: req.FollowerID,
+					FolloweeID: req.FolloweeID,
+				}
+				// ignore if already exists
+				config.DB.FirstOrCreate(&follow, follow)
+				config.DB.Delete(&req) // clean up request
+			}
+		}
 	} else {
+		// Switch to private
 		user.Type = "private"
 	}
 
@@ -208,4 +174,14 @@ func ToggleAccountType(c echo.Context) error {
 		"message": "account type toggled successfully",
 		"type":    user.Type,
 	})
+}
+
+// -------------------- Helpers --------------------
+func userResponse(user models.User) echo.Map {
+	return echo.Map{
+		"id":          user.ID,
+		"username":    user.Username,
+		"email":       user.Email,
+		"profile_pic": user.ProfilePic,
+	}
 }

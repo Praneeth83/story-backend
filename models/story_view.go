@@ -7,4 +7,8 @@ type StoryView struct {
 	StoryID  uint      `gorm:"index:idx_story_viewer,unique;not null" json:"story_id"`
 	ViewerID uint      `gorm:"index:idx_story_viewer,unique;not null" json:"viewer_id"`
 	ViewedAt time.Time `gorm:"autoCreateTime" json:"viewed_at"`
+
+	// -------- Relations --------
+	Story  Story `gorm:"foreignKey:StoryID" json:"story"`
+	Viewer User  `gorm:"foreignKey:ViewerID" json:"viewer"`
 }
